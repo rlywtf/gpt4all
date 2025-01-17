@@ -9,61 +9,82 @@ import download
 import network
 import mysettings
 
-Drawer {
+Rectangle {
     id: chatDrawer
-    modal: false
 
     Theme {
         id: theme
     }
 
-    signal downloadClicked
-    signal aboutClicked
+    color: theme.viewBackground
 
-    background: Rectangle {
-        height: parent.height
-        color: theme.containerBackground
+    Rectangle {
+        id: borderRight
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.right: parent.right
+        width: 1
+        color: theme.dividerColor
     }
 
     Item {
-        anchors.fill: parent
-        anchors.margins: 10
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: borderRight.left
 
         Accessible.role: Accessible.Pane
         Accessible.name: qsTr("Drawer")
         Accessible.description: qsTr("Main navigation drawer")
 
-        MyButton {
+        MySettingsButton {
             id: newChat
+            anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
+            anchors.margins: 20
             font.pixelSize: theme.fontSizeLarger
-            topPadding: 20
-            bottomPadding: 20
-            text: qsTr("\uFF0B New chat")
+            topPadding: 24
+            bottomPadding: 24
+            text: qsTr("\uFF0B New Chat")
             Accessible.description: qsTr("Create a new chat")
             onClicked: {
-                ChatListModel.addChat();
-                Network.sendNewChat(ChatListModel.count)
+                ChatListModel.addChat()
+                conversationList.positionViewAtIndex(0, ListView.Beginning)
+                Network.trackEvent("new_chat", {"number_of_chats": ChatListModel.count})
             }
+        }
+
+        Rectangle {
+            id: divider
+            anchors.top: newChat.bottom
+            anchors.margins: 20
+            anchors.topMargin: 14
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 1
+            color: theme.dividerColor
         }
 
         ScrollView {
             anchors.left: parent.left
             anchors.right: parent.right
-            anchors.rightMargin: -10
-            anchors.topMargin: 10
-            anchors.top: newChat.bottom
-            anchors.bottom: checkForUpdatesButton.top
-            anchors.bottomMargin: 10
+            anchors.topMargin: 15
+            anchors.top: divider.bottom
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 15
             ScrollBar.vertical.policy: ScrollBar.AlwaysOff
             clip: true
 
             ListView {
                 id: conversationList
                 anchors.fill: parent
+                anchors.leftMargin: 10
                 anchors.rightMargin: 10
                 model: ChatListModel
+
+                Component.onCompleted: ChatListModel.loadChats()
+
                 ScrollBar.vertical: ScrollBar {
                     parent: conversationList.parent
                     anchors.top: conversationList.top
@@ -71,107 +92,164 @@ Drawer {
                     anchors.bottom: conversationList.bottom
                 }
 
+                Component {
+                    id: sectionHeading
+                    Rectangle {
+                        width: ListView.view.width
+                        height: childrenRect.height
+                        color: "transparent"
+                        property bool isServer: ChatListModel.get(parent.index) && ChatListModel.get(parent.index).isServer
+                        visible: !isServer || MySettings.serverChat
+
+                        required property string section
+
+                        Text {
+                            leftPadding: 10
+                            rightPadding: 10
+                            topPadding: 15
+                            bottomPadding: 5
+                            text: parent.section
+                            color: theme.chatDrawerSectionHeader
+                            font.pixelSize: theme.fontSizeSmallest
+                        }
+                    }
+                }
+
+                section.property: "section"
+                section.criteria: ViewSection.FullString
+                section.delegate: sectionHeading
+
                 delegate: Rectangle {
                     id: chatRectangle
                     width: conversationList.width
-                    height: chatName.height
+                    height: chatNameBox.height + 20
                     property bool isCurrent: ChatListModel.currentChat === ChatListModel.get(index)
                     property bool isServer: ChatListModel.get(index) && ChatListModel.get(index).isServer
                     property bool trashQuestionDisplayed: false
                     visible: !isServer || MySettings.serverChat
                     z: isCurrent ? 199 : 1
-                    color: index % 2 === 0 ? theme.darkContrast : theme.lightContrast
+                    color: isCurrent ? theme.selectedBackground : "transparent"
                     border.width: isCurrent
-                    border.color: chatName.readOnly ? theme.assistantColor : theme.userColor
-                    TextField {
-                        id: chatName
+                    border.color: theme.dividerColor
+                    radius: 10
+
+                    Rectangle {
+                        id: chatNameBox
+                        height: chatName.height
                         anchors.left: parent.left
-                        anchors.right: buttons.left
-                        color: theme.textColor
-                        padding: 15
-                        focus: false
-                        readOnly: true
-                        wrapMode: Text.NoWrap
-                        hoverEnabled: false // Disable hover events on the TextArea
-                        selectByMouse: false // Disable text selection in the TextArea
-                        font.pixelSize: theme.fontSizeLarger
-                        text: readOnly ? metrics.elidedText : name
-                        horizontalAlignment: TextInput.AlignLeft
-                        opacity: trashQuestionDisplayed ? 0.5 : 1.0
-                        TextMetrics {
-                            id: metrics
-                            font: chatName.font
-                            text: name
-                            elide: Text.ElideRight
-                            elideWidth: chatName.width - 40
-                        }
-                        background: Rectangle {
-                            color: "transparent"
-                        }
-                        onEditingFinished: {
-                            // Work around a bug in qml where we're losing focus when the whole window
-                            // goes out of focus even though this textfield should be marked as not
-                            // having focus
-                            if (chatName.readOnly)
-                                return;
-                            changeName();
-                            Network.sendRenameChat()
-                        }
-                        function changeName() {
-                            ChatListModel.get(index).name = chatName.text
-                            chatName.focus = false
-                            chatName.readOnly = true
-                            chatName.selectByMouse = false
-                        }
-                        TapHandler {
-                            onTapped: {
-                                if (isCurrent)
-                                    return;
-                                ChatListModel.currentChat = ChatListModel.get(index);
+                        anchors.right: trashButton.left
+                        anchors.verticalCenter: chatRectangle.verticalCenter
+                        anchors.leftMargin: 5
+                        anchors.rightMargin: 5
+                        radius: 5
+                        color: chatName.readOnly ? "transparent" : theme.chatNameEditBgColor
+
+                        TextField {
+                            id: chatName
+                            anchors.left: parent.left
+                            anchors.right: editButton.left
+                            anchors.verticalCenter: chatNameBox.verticalCenter
+                            topPadding: 5
+                            bottomPadding: 5
+                            color: theme.styledTextColor
+                            focus: false
+                            readOnly: true
+                            wrapMode: Text.NoWrap
+                            hoverEnabled: false // Disable hover events on the TextArea
+                            selectByMouse: false // Disable text selection in the TextArea
+                            font.pixelSize: theme.fontSizeLarge
+                            font.bold: true
+                            text: readOnly ? metrics.elidedText : name
+                            horizontalAlignment: TextInput.AlignLeft
+                            opacity: trashQuestionDisplayed ? 0.5 : 1.0
+                            TextMetrics {
+                                id: metrics
+                                font: chatName.font
+                                text: name
+                                elide: Text.ElideRight
+                                elideWidth: chatName.width - 15
                             }
+                            background: Rectangle {
+                                color: "transparent"
+                            }
+                            onEditingFinished: {
+                                // Work around a bug in qml where we're losing focus when the whole window
+                                // goes out of focus even though this textfield should be marked as not
+                                // having focus
+                                if (chatName.readOnly)
+                                    return;
+                                changeName();
+                            }
+                            function changeName() {
+                                Network.trackChatEvent("rename_chat");
+                                ChatListModel.get(index).name = chatName.text;
+                                chatName.focus = false;
+                                chatName.readOnly = true;
+                                chatName.selectByMouse = false;
+                            }
+                            TapHandler {
+                                onTapped: {
+                                    if (isCurrent)
+                                        return;
+                                    ChatListModel.currentChat = ChatListModel.get(index);
+                                }
+                            }
+                            Accessible.role: Accessible.Button
+                            Accessible.name: text
+                            Accessible.description: qsTr("Select the current chat or edit the chat when in edit mode")
                         }
-                        Accessible.role: Accessible.Button
-                        Accessible.name: qsTr("Select the current chat")
-                        Accessible.description: qsTr("Select the current chat or edit the chat when in edit mode")
-                    }
-                    Row {
-                        id: buttons
-                        anchors.verticalCenter: chatName.verticalCenter
-                        anchors.right: chatRectangle.right
-                        anchors.rightMargin: 10
-                        spacing: 10
                         MyToolButton {
                             id: editButton
-                            width: 30
-                            height: 30
-                            visible: isCurrent && !isServer
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.right: parent.right
+                            anchors.rightMargin: 5
+                            imageWidth: 24
+                            imageHeight: 24
+                            visible: isCurrent && !isServer && chatName.readOnly
                             opacity: trashQuestionDisplayed ? 0.5 : 1.0
                             source: "qrc:/gpt4all/icons/edit.svg"
                             onClicked: {
-                                chatName.focus = true
-                                chatName.readOnly = false
-                                chatName.selectByMouse = true
+                                chatName.focus = true;
+                                chatName.readOnly = false;
+                                chatName.selectByMouse = true;
                             }
                             Accessible.name: qsTr("Edit chat name")
                         }
                         MyToolButton {
-                            id: trashButton
-                            width: 30
-                            height: 30
-                            visible: isCurrent && !isServer
-                            source: "qrc:/gpt4all/icons/trash.svg"
-                            onClicked: {
-                                trashQuestionDisplayed = true
-                                timer.start()
-                            }
-                            Accessible.name: qsTr("Delete chat")
+                            id: okButton
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.right: parent.right
+                            anchors.rightMargin: 5
+                            imageWidth: 24
+                            imageHeight: 24
+                            visible: isCurrent && !isServer && !chatName.readOnly
+                            opacity: trashQuestionDisplayed ? 0.5 : 1.0
+                            source: "qrc:/gpt4all/icons/check.svg"
+                            onClicked: chatName.changeName()
+                            Accessible.name: qsTr("Save chat name")
                         }
+                    }
+
+                    MyToolButton {
+                        id: trashButton
+                        anchors.verticalCenter: chatNameBox.verticalCenter
+                        anchors.right: chatRectangle.right
+                        anchors.rightMargin: 10
+                        imageWidth: 24
+                        imageHeight: 24
+                        visible: isCurrent && !isServer
+                        source: "qrc:/gpt4all/icons/trash.svg"
+                        onClicked: {
+                            trashQuestionDisplayed = true
+                            timer.start()
+                        }
+                        Accessible.name: qsTr("Delete chat")
                     }
                     Rectangle {
                         id: trashSureQuestion
-                        anchors.top: buttons.bottom
+                        anchors.top: trashButton.bottom
                         anchors.topMargin: 10
-                        anchors.right: buttons.right
+                        anchors.right: trashButton.right
                         width: childrenRect.width
                         height: childrenRect.height
                         color: chatRectangle.color
@@ -198,8 +276,8 @@ Drawer {
                                     color: "transparent"
                                 }
                                 onClicked: {
+                                    Network.trackChatEvent("remove_chat")
                                     ChatListModel.removeChat(ChatListModel.get(index))
-                                    Network.sendRemoveChat()
                                 }
                                 Accessible.role: Accessible.Button
                                 Accessible.name: qsTr("Confirm chat deletion")
@@ -238,46 +316,6 @@ Drawer {
                 Accessible.role: Accessible.List
                 Accessible.name: qsTr("List of chats")
                 Accessible.description: qsTr("List of chats in the drawer dialog")
-            }
-        }
-
-        MyButton {
-            id: checkForUpdatesButton
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: downloadButton.top
-            anchors.bottomMargin: 10
-            text: qsTr("Updates")
-            font.pixelSize: theme.fontSizeLarge
-            Accessible.description: qsTr("Launch an external application that will check for updates to the installer")
-            onClicked: {
-                if (!LLM.checkForUpdates())
-                    checkForUpdatesError.open()
-            }
-        }
-
-        MyButton {
-            id: downloadButton
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: aboutButton.top
-            anchors.bottomMargin: 10
-            text: qsTr("Downloads")
-            Accessible.description: qsTr("Launch a dialog to download new models")
-            onClicked: {
-                downloadClicked()
-            }
-        }
-
-        MyButton {
-            id: aboutButton
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            text: qsTr("About")
-            Accessible.description: qsTr("Launch a dialog to show the about page")
-            onClicked: {
-                aboutClicked()
             }
         }
     }

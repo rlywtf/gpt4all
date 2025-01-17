@@ -8,9 +8,6 @@ parameters:
   run-all-workflows:
     type: boolean
     default: false
-  run-default-workflow:
-    type: boolean
-    default: false
   run-python-workflow:
     type: boolean
     default: false
@@ -20,19 +17,18 @@ parameters:
   run-ts-workflow:
     type: boolean
     default: false
-  run-csharp-workflow:
-    type: boolean
-    default: false
 
 jobs:
-  default-job:
+  # work around CircleCI-Public/path-filtering-orb#20
+  noop:
     docker:
-      - image: circleci/python:3.7
+      - image: cimg/base:current
     steps:
-      - run: echo "CircleCI pipeline triggered"
+      - run: "true"
+
   build-offline-chat-installer-macos:
     macos:
-      xcode: 14.0.0
+      xcode: 15.4.0
     steps:
       - checkout
       - run:
@@ -40,48 +36,137 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
-      - restore_cache:  # this is the new step to restore cache
+      - restore_cache:
           keys:
-            - macos-qt-cache_v2
+            - ccache-gpt4all-macos-
+      - run:
+          name: Install Rosetta
+          command: softwareupdate --install-rosetta --agree-to-license  # needed for QtIFW
+      - run:
+          name: Install dependencies
+          command: brew install ccache wget
       - run:
           name: Installing Qt
           command: |
-            if [ ! -d ~/Qt ]; then
-              curl -o qt-unified-macOS-x64-4.6.0-online.dmg https://gpt4all.io/ci/qt-unified-macOS-x64-4.6.0-online.dmg
-              hdiutil attach qt-unified-macOS-x64-4.6.0-online.dmg
-              /Volumes/qt-unified-macOS-x64-4.6.0-online/qt-unified-macOS-x64-4.6.0-online.app/Contents/MacOS/qt-unified-macOS-x64-4.6.0-online --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.46 qt.tools.ninja qt.qt6.651.clang_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
-              hdiutil detach /Volumes/qt-unified-macOS-x64-4.6.0-online
-            fi
-      - save_cache:  # this is the new step to save cache
-          key: macos-qt-cache_v2
-          paths:
-            - ~/Qt
+            wget "https://gpt4all.io/ci/qt-unified-macOS-x64-4.6.0-online.dmg"
+            hdiutil attach qt-unified-macOS-x64-4.6.0-online.dmg
+            /Volumes/qt-unified-macOS-x64-4.6.0-online/qt-unified-macOS-x64-4.6.0-online.app/Contents/MacOS/qt-unified-macOS-x64-4.6.0-online --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.clang_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
+            hdiutil detach /Volumes/qt-unified-macOS-x64-4.6.0-online
+      - run:
+          name: Setup Keychain
+          command: |
+            echo $MAC_SIGNING_CERT | base64 --decode > cert.p12
+            security create-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security default-keychain -s sign.keychain
+            security unlock-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security import cert.p12 -k sign.keychain -P "$MAC_SIGNING_CERT_PWD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MAC_KEYCHAIN_KEY" sign.keychain
       - run:
           name: Build
+          no_output_timeout: 30m
           command: |
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
             mkdir build
             cd build
-            export PATH=$PATH:$HOME/Qt/Tools/QtInstallerFramework/4.6/bin
+            export PATH=$PATH:$HOME/Qt/Tools/QtInstallerFramework/4.8/bin
             ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake \
-              -DCMAKE_GENERATOR:STRING=Ninja \
+              -S ../gpt4all-chat -B . -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH:PATH=~/Qt/6.5.1/macos/lib/cmake \
+              -DCMAKE_MAKE_PROGRAM:FILEPATH=~/Qt/Tools/Ninja/ninja \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DBUILD_UNIVERSAL=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.6 \
+              -DGGML_METAL_MACOSX_VERSION_MIN=12.6 \
               -DMACDEPLOYQT=~/Qt/6.5.1/macos/bin/macdeployqt \
               -DGPT4ALL_OFFLINE_INSTALLER=ON \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_PREFIX_PATH:PATH=~/Qt/6.5.1/macos/lib/cmake/Qt6 \
-              -DCMAKE_MAKE_PROGRAM:FILEPATH=~/Qt/Tools/Ninja/ninja \
-              -S ../gpt4all-chat \
-              -B .
+              -DGPT4ALL_SIGN_INSTALL=ON
             ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target all
             ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target install
             ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target package
+            ccache -s
             mkdir upload
             cp gpt4all-installer-* upload
+      # persist the unsigned installer
       - store_artifacts:
           path: build/upload
-  build-offline-chat-installer-linux:
-    machine:
-      image: ubuntu-2204:2023.04.2
+      - save_cache:
+          key: ccache-gpt4all-macos-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
+      # add workspace so signing jobs can connect & obtain dmg
+      - persist_to_workspace:
+          root: build
+          # specify path to only include components we want to persist
+          # accross builds
+          paths:
+            - upload
+
+  sign-offline-chat-installer-macos:
+    macos:
+      xcode: 15.4.0
+    steps:
+      - checkout
+      # attach to a workspace containing unsigned dmg
+      - attach_workspace:
+          at: build
+      - run:
+          name: "Setup Keychain"
+          command: |
+            echo $MAC_SIGNING_CERT | base64 --decode > cert.p12
+            security create-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security default-keychain -s sign.keychain
+            security unlock-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security import cert.p12 -k sign.keychain -P "$MAC_SIGNING_CERT_PWD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MAC_KEYCHAIN_KEY" sign.keychain
+            rm cert.p12
+      - run:
+          name: "Sign App Bundle"
+          command: |
+            python3 -m pip install click
+            python3 gpt4all-chat/cmake/sign_dmg.py --input-dmg build/upload/gpt4all-installer-darwin.dmg --output-dmg build/upload/gpt4all-installer-darwin-signed.dmg --signing-identity "$MAC_SIGNING_CERT_NAME"
+      - run:
+          name: "Sign DMG"
+          command: |
+            codesign --options runtime --timestamp -s "$MAC_SIGNING_CERT_NAME" build/upload/gpt4all-installer-darwin-signed.dmg
+      # add workspace so signing jobs can connect & obtain dmg
+      - persist_to_workspace:
+          root: build
+          # specify path to only include components we want to persist
+          # accross builds
+          paths:
+            - upload
+
+  notarize-offline-chat-installer-macos:
+    macos:
+      xcode: 15.4.0
+    steps:
+      - checkout
+      - attach_workspace:
+          at: build
+      - run:
+          name: "Notarize"
+          command: |
+            xcrun notarytool submit build/upload/gpt4all-installer-darwin-signed.dmg --apple-id "$MAC_NOTARIZATION_ID" --team-id "$MAC_NOTARIZATION_TID" --password "$MAC_NOTARIZATION_KEY" --wait  | tee notarize_log.txt
+      - run:
+          name: "Report Notarization Failure"
+          command: |
+            NID=`python3 .circleci/grab_notary_id.py notarize_log.txt` && export NID
+            xcrun notarytool log $NID --keychain-profile "notary-profile"
+            exit 1
+          when: on_fail
+      - run:
+          name: "Staple"
+          command: |
+            xcrun stapler staple build/upload/gpt4all-installer-darwin-signed.dmg
+      - store_artifacts:
+          path: build/upload
+
+  build-online-chat-installer-macos:
+    macos:
+      xcode: 15.4.0
     steps:
       - checkout
       - run:
@@ -89,27 +174,173 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
-      - restore_cache:  # this is the new step to restore cache
+      - restore_cache:
           keys:
-            - linux-qt-cache
+            - ccache-gpt4all-macos-
       - run:
-          name: Setup Linux and Dependencies
-          command: |
-            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list http://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
-            sudo apt update && sudo apt install -y libfontconfig1 libfreetype6 libx11-6 libx11-xcb1 libxext6 libxfixes3 libxi6 libxrender1 libxcb1 libxcb-cursor0 libxcb-glx0 libxcb-keysyms1 libxcb-image0 libxcb-shm0 libxcb-icccm4 libxcb-sync1 libxcb-xfixes0 libxcb-shape0 libxcb-randr0 libxcb-render-util0 libxcb-util1 libxcb-xinerama0 libxcb-xkb1 libxkbcommon0 libxkbcommon-x11-0 bison build-essential flex gperf python3 gcc g++ libgl1-mesa-dev libwayland-dev vulkan-sdk patchelf
+          name: Install Rosetta
+          command: softwareupdate --install-rosetta --agree-to-license  # needed for QtIFW
+      - run:
+          name: Install dependencies
+          command: brew install ccache wget
       - run:
           name: Installing Qt
           command: |
-            if [ ! -d ~/Qt ]; then
-              wget https://gpt4all.io/ci/qt-unified-linux-x64-4.6.0-online.run
-              chmod +x qt-unified-linux-x64-4.6.0-online.run
-              ./qt-unified-linux-x64-4.6.0-online.run --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.46 qt.tools.ninja qt.qt6.651.gcc_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver qt.qt6.651.qtwaylandcompositor
-            fi
-      - save_cache:  # this is the new step to save cache
-          key: linux-qt-cache
+            wget "https://gpt4all.io/ci/qt-unified-macOS-x64-4.6.0-online.dmg"
+            hdiutil attach qt-unified-macOS-x64-4.6.0-online.dmg
+            /Volumes/qt-unified-macOS-x64-4.6.0-online/qt-unified-macOS-x64-4.6.0-online.app/Contents/MacOS/qt-unified-macOS-x64-4.6.0-online --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.clang_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
+            hdiutil detach /Volumes/qt-unified-macOS-x64-4.6.0-online
+      - run:
+          name: Setup Keychain
+          command: |
+            echo $MAC_SIGNING_CERT | base64 --decode > cert.p12
+            security create-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security default-keychain -s sign.keychain
+            security unlock-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security import cert.p12 -k sign.keychain -P "$MAC_SIGNING_CERT_PWD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MAC_KEYCHAIN_KEY" sign.keychain
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
+            mkdir build
+            cd build
+            export PATH=$PATH:$HOME/Qt/Tools/QtInstallerFramework/4.8/bin
+            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake \
+              -S ../gpt4all-chat -B . -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH:PATH=~/Qt/6.5.1/macos/lib/cmake \
+              -DCMAKE_MAKE_PROGRAM:FILEPATH=~/Qt/Tools/Ninja/ninja \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DBUILD_UNIVERSAL=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.6 \
+              -DGGML_METAL_MACOSX_VERSION_MIN=12.6 \
+              -DMACDEPLOYQT=~/Qt/6.5.1/macos/bin/macdeployqt \
+              -DGPT4ALL_OFFLINE_INSTALLER=OFF \
+              -DGPT4ALL_SIGN_INSTALL=ON
+            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target all
+            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target install
+            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target package
+            ccache -s
+            mkdir upload
+            cp gpt4all-installer-* upload
+            tar -cvzf upload/repository.tar.gz -C _CPack_Packages/Darwin/IFW/gpt4all-installer-darwin repository
+      # persist the unsigned installer
+      - store_artifacts:
+          path: build/upload
+      - save_cache:
+          key: ccache-gpt4all-macos-{{ epoch }}
+          when: always
           paths:
-            - ~/Qt
+            - ../.ccache
+      # add workspace so signing jobs can connect & obtain dmg
+      - persist_to_workspace:
+          root: build
+          # specify path to only include components we want to persist
+          # accross builds
+          paths:
+            - upload
+
+  sign-online-chat-installer-macos:
+    macos:
+      xcode: 15.4.0
+    steps:
+      - checkout
+      # attach to a workspace containing unsigned dmg
+      - attach_workspace:
+          at: build
+      - run:
+          name: "Setup Keychain"
+          command: |
+            echo $MAC_SIGNING_CERT | base64 --decode > cert.p12
+            security create-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security default-keychain -s sign.keychain
+            security unlock-keychain -p "$MAC_KEYCHAIN_KEY" sign.keychain
+            security import cert.p12 -k sign.keychain -P "$MAC_SIGNING_CERT_PWD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MAC_KEYCHAIN_KEY" sign.keychain
+            rm cert.p12
+      - run:
+          name: "Sign App Bundle"
+          command: |
+            python3 -m pip install click
+            python3 gpt4all-chat/cmake/sign_dmg.py --input-dmg build/upload/gpt4all-installer-darwin.dmg --output-dmg build/upload/gpt4all-installer-darwin-signed.dmg --signing-identity "$MAC_SIGNING_CERT_NAME"
+      - run:
+          name: "Sign DMG"
+          command: |
+            codesign --options runtime --timestamp -s "$MAC_SIGNING_CERT_NAME" build/upload/gpt4all-installer-darwin-signed.dmg
+      # add workspace so signing jobs can connect & obtain dmg
+      - persist_to_workspace:
+          root: build
+          # specify path to only include components we want to persist
+          # accross builds
+          paths:
+            - upload
+
+  notarize-online-chat-installer-macos:
+    macos:
+      xcode: 15.4.0
+    steps:
+      - checkout
+      - attach_workspace:
+          at: build
+      - run:
+          name: "Notarize"
+          command: |
+            xcrun notarytool submit build/upload/gpt4all-installer-darwin-signed.dmg --apple-id "$MAC_NOTARIZATION_ID" --team-id "$MAC_NOTARIZATION_TID" --password "$MAC_NOTARIZATION_KEY" --wait  | tee notarize_log.txt
+      - run:
+          name: "Report Notarization Failure"
+          command: |
+            NID=`python3 .circleci/grab_notary_id.py notarize_log.txt` && export NID
+            xcrun notarytool log $NID --keychain-profile "notary-profile"
+            exit 1
+          when: on_fail
+      - run:
+          name: "Staple"
+          command: |
+            xcrun stapler staple build/upload/gpt4all-installer-darwin-signed.dmg
+      - store_artifacts:
+          path: build/upload
+
+  build-offline-chat-installer-linux:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - checkout
+      - run:
+          name: Update Submodules
+          command: |
+            git submodule sync
+            git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-linux-amd64-
+      - run:
+          name: Setup Linux and Dependencies
+          command: |
+            # Prevent apt-get from interactively prompting for service restart
+            echo "\$nrconf{restart} = 'l'" | sudo tee /etc/needrestart/conf.d/90-autorestart.conf >/dev/null
+            wget -qO- "https://packages.lunarg.com/lunarg-signing-key-pub.asc" | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+            wget -qO- "https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-jammy.list" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-jammy.list
+            wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            packages=(
+              bison build-essential ccache cuda-compiler-11-8 flex g++-12 gperf libcublas-dev-11-8 libfontconfig1
+              libfreetype6 libgl1-mesa-dev libmysqlclient21 libnvidia-compute-550-server libodbc2 libpq5 libwayland-dev
+              libx11-6 libx11-xcb1 libxcb-cursor0 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+              libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-util1 libxcb-xfixes0 libxcb-xinerama0
+              libxcb-xkb1 libxcb1 libxext6 libxfixes3 libxi6 libxkbcommon-dev libxkbcommon-x11-0 libxrender1 patchelf
+              python3 vulkan-sdk
+            )
+            sudo apt-get update
+            sudo apt-get install -y "${packages[@]}"
+      - run:
+          name: Installing Qt
+          command: |
+            wget "https://gpt4all.io/ci/qt-unified-linux-x64-4.6.0-online.run"
+            chmod +x qt-unified-linux-x64-4.6.0-online.run
+            ./qt-unified-linux-x64-4.6.0-online.run --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.gcc_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
       - run:
           name: Build linuxdeployqt
           command: |
@@ -117,23 +348,122 @@ jobs:
             cd linuxdeployqt && qmake && sudo make install
       - run:
           name: Build
+          no_output_timeout: 30m
           command: |
             set -eo pipefail
             export CMAKE_PREFIX_PATH=~/Qt/6.5.1/gcc_64/lib/cmake
-            export PATH=$PATH:$HOME/Qt/Tools/QtInstallerFramework/4.6/bin
+            export PATH=$PATH:$HOME/Qt/Tools/QtInstallerFramework/4.8/bin
+            export PATH=$PATH:/usr/local/cuda/bin
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
             mkdir build
             cd build
             mkdir upload
-            ~/Qt/Tools/CMake/bin/cmake -DGPT4ALL_OFFLINE_INSTALLER=ON -DCMAKE_BUILD_TYPE=Release -S ../gpt4all-chat -B .
-            ~/Qt/Tools/CMake/bin/cmake --build . --target all
-            ~/Qt/Tools/CMake/bin/cmake --build . --target install
-            ~/Qt/Tools/CMake/bin/cmake --build . --target package
+            ~/Qt/Tools/CMake/bin/cmake \
+              -S ../gpt4all-chat -B . \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=gcc-12 \
+              -DCMAKE_CXX_COMPILER=g++-12 \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON \
+              -DGPT4ALL_OFFLINE_INSTALLER=ON
+            ~/Qt/Tools/CMake/bin/cmake --build . -j$(nproc) --target all
+            ~/Qt/Tools/CMake/bin/cmake --build . -j$(nproc) --target install
+            ~/Qt/Tools/CMake/bin/cmake --build . -j$(nproc) --target package
+            ccache -s
             cp gpt4all-installer-* upload
       - store_artifacts:
           path: build/upload
+      - save_cache:
+          key: ccache-gpt4all-linux-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
+
+  build-online-chat-installer-linux:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - checkout
+      - run:
+          name: Update Submodules
+          command: |
+            git submodule sync
+            git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-linux-amd64-
+      - run:
+          name: Setup Linux and Dependencies
+          command: |
+            # Prevent apt-get from interactively prompting for service restart
+            echo "\$nrconf{restart} = 'l'" | sudo tee /etc/needrestart/conf.d/90-autorestart.conf >/dev/null
+            wget -qO- "https://packages.lunarg.com/lunarg-signing-key-pub.asc" | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+            wget -qO- "https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-jammy.list" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-jammy.list
+            wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            packages=(
+              bison build-essential ccache cuda-compiler-11-8 flex g++-12 gperf libcublas-dev-11-8 libfontconfig1
+              libfreetype6 libgl1-mesa-dev libmysqlclient21 libnvidia-compute-550-server libodbc2 libpq5 libwayland-dev
+              libx11-6 libx11-xcb1 libxcb-cursor0 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+              libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-util1 libxcb-xfixes0 libxcb-xinerama0
+              libxcb-xkb1 libxcb1 libxext6 libxfixes3 libxi6 libxkbcommon-dev libxkbcommon-x11-0 libxrender1 patchelf
+              python3 vulkan-sdk
+            )
+            sudo apt-get update
+            sudo apt-get install -y "${packages[@]}"
+      - run:
+          name: Installing Qt
+          command: |
+            wget "https://gpt4all.io/ci/qt-unified-linux-x64-4.6.0-online.run"
+            chmod +x qt-unified-linux-x64-4.6.0-online.run
+            ./qt-unified-linux-x64-4.6.0-online.run --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.gcc_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
+      - run:
+          name: Build linuxdeployqt
+          command: |
+            git clone https://github.com/nomic-ai/linuxdeployqt
+            cd linuxdeployqt && qmake && sudo make install
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+            set -eo pipefail
+            export CMAKE_PREFIX_PATH=~/Qt/6.5.1/gcc_64/lib/cmake
+            export PATH=$PATH:$HOME/Qt/Tools/QtInstallerFramework/4.8/bin
+            export PATH=$PATH:/usr/local/cuda/bin
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
+            mkdir build
+            cd build
+            mkdir upload
+            ~/Qt/Tools/CMake/bin/cmake \
+              -S ../gpt4all-chat -B . \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=gcc-12 \
+              -DCMAKE_CXX_COMPILER=g++-12 \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON \
+              -DGPT4ALL_OFFLINE_INSTALLER=OFF
+            ~/Qt/Tools/CMake/bin/cmake --build . -j$(nproc) --target all
+            ~/Qt/Tools/CMake/bin/cmake --build . -j$(nproc) --target install
+            ~/Qt/Tools/CMake/bin/cmake --build . -j$(nproc) --target package
+            ccache -s
+            cp gpt4all-installer-* upload
+            tar -cvzf upload/repository.tar.gz -C _CPack_Packages/Linux/IFW/gpt4all-installer-linux repository
+      - store_artifacts:
+          path: build/upload
+      - save_cache:
+          key: ccache-gpt4all-linux-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
+
   build-offline-chat-installer-windows:
     machine:
-      image: 'windows-server-2019-vs2019:2022.08.1'
+      # we use 2024.04.01 because nvcc complains about the MSVC ver if we use anything newer
+      image: windows-server-2022-gui:2024.04.1
       resource_class: windows.large
       shell: powershell.exe -ExecutionPolicy Bypass
     steps:
@@ -143,106 +473,121 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
-      - restore_cache:  # this is the new step to restore cache
+      - restore_cache:
           keys:
-            - windows-qt-cache
+            - ccache-gpt4all-win-amd64-
+      - run:
+          name: Install dependencies
+          command: choco install -y ccache wget
       - run:
           name: Installing Qt
           command: |
-            if (-not (Test-Path C:\Qt)) {
-              Invoke-WebRequest -Uri https://gpt4all.io/ci/qt-unified-windows-x64-4.6.0-online.exe -OutFile qt-unified-windows-x64-4.6.0-online.exe
-              & .\qt-unified-windows-x64-4.6.0-online.exe --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email ${Env:QT_EMAIL} --password ${Env:QT_PASSWORD} install qt.tools.cmake qt.tools.ifw.46 qt.tools.ninja qt.qt6.651.win64_msvc2019_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
-            }
-      - save_cache:  # this is the new step to save cache
-          key: windows-qt-cache
-          paths:
-            - C:\Qt
+            wget.exe "https://gpt4all.io/ci/qt-unified-windows-x64-4.6.0-online.exe"
+            & .\qt-unified-windows-x64-4.6.0-online.exe --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email ${Env:QT_EMAIL} --password ${Env:QT_PASSWORD} install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.win64_msvc2019_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
       - run:
           name: Install VulkanSDK
           command: |
-            Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe -OutFile VulkanSDK-1.3.261.1-Installer.exe
+            wget.exe "https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe"
             .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
       - run:
-          name: Build
+          name: Install CUDA Toolkit
           command: |
-            $Env:PATH = "${Env:PATH};C:\Program Files (x86)\Windows Kits\10\bin\x64"
-            $Env:PATH = "${Env:PATH};C:\Program Files (x86)\Windows Kits\10\bin\10.0.22000.0\x64"
-            $Env:PATH = "${Env:PATH};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\bin\HostX64\x64"
+            wget.exe "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
+            .\cuda_11.8.0_windows_network.exe -s cudart_11.8 nvcc_11.8 cublas_11.8 cublas_dev_11.8
+      - run:
+          name: "Install Dotnet 8"
+          command: |
+            mkdir dotnet
+            cd dotnet
+            $dotnet_url="https://download.visualstudio.microsoft.com/download/pr/5af098e1-e433-4fda-84af-3f54fd27c108/6bd1c6e48e64e64871957289023ca590/dotnet-sdk-8.0.302-win-x64.zip"
+            wget.exe "$dotnet_url"
+            Expand-Archive -LiteralPath .\dotnet-sdk-8.0.302-win-x64.zip
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            $Env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE=$true
+            dotnet tool install --global AzureSignTool
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+            $vsInstallPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -property installationpath
+            Import-Module "${vsInstallPath}\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+            Enter-VsDevShell -VsInstallPath "$vsInstallPath" -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+
             $Env:PATH = "${Env:PATH};C:\VulkanSDK\1.3.261.1\bin"
-            $Env:PATH = "${Env:PATH};C:\Qt\Tools\QtInstallerFramework\4.6\bin"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22000.0\ucrt\x64"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22000.0\um\x64"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\lib\x64"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\ATLMFC\lib\x64"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\ucrt"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\um"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\shared"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\winrt"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\cppwinrt"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\VS\include"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\include"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\ATLMFC\include"
+            $Env:PATH = "${Env:PATH};C:\Qt\Tools\QtInstallerFramework\4.8\bin"
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            ccache -o "cache_dir=${pwd}\..\.ccache" -o max_size=500M -p -z
             mkdir build
             cd build
             & "C:\Qt\Tools\CMake_64\bin\cmake.exe" `
-              "-DCMAKE_GENERATOR:STRING=Ninja" `
-              "-DCMAKE_BUILD_TYPE=Release" `
+              -S ..\gpt4all-chat -B . -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
               "-DCMAKE_PREFIX_PATH:PATH=C:\Qt\6.5.1\msvc2019_64" `
               "-DCMAKE_MAKE_PROGRAM:FILEPATH=C:\Qt\Tools\Ninja\ninja.exe" `
-              "-DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON" `
-              "-DGPT4ALL_OFFLINE_INSTALLER=ON" `
-              "-S ..\gpt4all-chat" `
-              "-B ."
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON `
+              -DGPT4ALL_OFFLINE_INSTALLER=ON
             & "C:\Qt\Tools\Ninja\ninja.exe"
             & "C:\Qt\Tools\Ninja\ninja.exe" install
             & "C:\Qt\Tools\Ninja\ninja.exe" package
+            ccache -s
             mkdir upload
             copy gpt4all-installer-win64.exe upload
       - store_artifacts:
           path: build/upload
-  build-gpt4all-chat-linux:
+            # add workspace so signing jobs can connect & obtain dmg
+      - save_cache:
+          key: ccache-gpt4all-win-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ..\.ccache
+      - persist_to_workspace:
+          root: build
+          # specify path to only include components we want to persist
+          # accross builds
+          paths:
+            - upload
+
+  sign-offline-chat-installer-windows:
     machine:
-      image: ubuntu-2204:2023.04.2
+      image: windows-server-2022-gui:2024.04.1
+      resource_class: windows.large
+      shell: powershell.exe -ExecutionPolicy Bypass
     steps:
       - checkout
+      - attach_workspace:
+          at: build
       - run:
-          name: Update Submodules
-          command: |
-            git submodule sync
-            git submodule update --init --recursive
-      - restore_cache:  # this is the new step to restore cache
-          keys:
-            - linux-qt-cache
+          name: Install dependencies
+          command: choco install -y wget
       - run:
-          name: Setup Linux and Dependencies
+          name: "Install Dotnet 8 && Azure Sign Tool"
           command: |
-            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list http://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
-            sudo apt update && sudo apt install -y libfontconfig1 libfreetype6 libx11-6 libx11-xcb1 libxext6 libxfixes3 libxi6 libxrender1 libxcb1 libxcb-cursor0 libxcb-glx0 libxcb-keysyms1 libxcb-image0 libxcb-shm0 libxcb-icccm4 libxcb-sync1 libxcb-xfixes0 libxcb-shape0 libxcb-randr0 libxcb-render-util0 libxcb-util1 libxcb-xinerama0 libxcb-xkb1 libxkbcommon0 libxkbcommon-x11-0 bison build-essential flex gperf python3 gcc g++ libgl1-mesa-dev libwayland-dev vulkan-sdk
+            mkdir dotnet
+            cd dotnet
+            $dotnet_url="https://download.visualstudio.microsoft.com/download/pr/5af098e1-e433-4fda-84af-3f54fd27c108/6bd1c6e48e64e64871957289023ca590/dotnet-sdk-8.0.302-win-x64.zip"
+            wget.exe "$dotnet_url"
+            Expand-Archive -LiteralPath .\dotnet-sdk-8.0.302-win-x64.zip
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            $Env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE=$true
+            dotnet tool install --global AzureSignTool
       - run:
-          name: Installing Qt
+          name: "Sign Windows Installer With AST"
           command: |
-            if [ ! -d ~/Qt ]; then
-              wget https://gpt4all.io/ci/qt-unified-linux-x64-4.6.0-online.run
-              chmod +x qt-unified-linux-x64-4.6.0-online.run
-              ./qt-unified-linux-x64-4.6.0-online.run --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.46 qt.tools.ninja qt.qt6.651.gcc_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver qt.qt6.651.qtwaylandcompositor
-            fi
-      - save_cache:  # this is the new step to save cache
-          key: linux-qt-cache
-          paths:
-            - ~/Qt
-      - run:
-          name: Build
-          command: |
-            export CMAKE_PREFIX_PATH=~/Qt/6.5.1/gcc_64/lib/cmake
-            mkdir build
-            cd build
-            ~/Qt/Tools/CMake/bin/cmake -DCMAKE_BUILD_TYPE=Release -S ../gpt4all-chat -B .
-            ~/Qt/Tools/CMake/bin/cmake --build . --target all
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            AzureSignTool.exe sign -du "https://gpt4all.io/index.html" -kvu https://gpt4all.vault.azure.net -kvi "$Env:AZSignGUID" -kvs "$Env:AZSignPWD" -kvc "$Env:AZSignCertName" -kvt "$Env:AZSignTID" -tr http://timestamp.digicert.com -v "$($(Get-Location).Path)\build\upload\gpt4all-installer-win64.exe"
+      - store_artifacts:
+          path: build/upload
 
-  build-gpt4all-chat-windows:
+  build-online-chat-installer-windows:
     machine:
-      image: 'windows-server-2019-vs2019:2022.08.1'
+      image: windows-server-2022-gui:2024.04.1
       resource_class: windows.large
       shell: powershell.exe -ExecutionPolicy Bypass
     steps:
@@ -252,60 +597,133 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
-      - restore_cache:  # this is the new step to restore cache
+      - restore_cache:
           keys:
-            - windows-qt-cache
+            - ccache-gpt4all-win-amd64-
+      - run:
+          name: Install dependencies
+          command: choco install -y ccache wget
       - run:
           name: Installing Qt
           command: |
-            if (-not (Test-Path C:\Qt)) {
-              Invoke-WebRequest -Uri https://gpt4all.io/ci/qt-unified-windows-x64-4.6.0-online.exe -OutFile qt-unified-windows-x64-4.6.0-online.exe
-              & .\qt-unified-windows-x64-4.6.0-online.exe --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email ${Env:QT_EMAIL} --password ${Env:QT_PASSWORD} install qt.tools.cmake qt.tools.ifw.46 qt.tools.ninja qt.qt6.651.win64_msvc2019_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
-            }
-      - save_cache:  # this is the new step to save cache
-          key: windows-qt-cache
-          paths:
-            - C:\Qt
+            wget.exe "https://gpt4all.io/ci/qt-unified-windows-x64-4.6.0-online.exe"
+            & .\qt-unified-windows-x64-4.6.0-online.exe --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email ${Env:QT_EMAIL} --password ${Env:QT_PASSWORD} install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.win64_msvc2019_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
       - run:
           name: Install VulkanSDK
           command: |
-            Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe -OutFile VulkanSDK-1.3.261.1-Installer.exe
+            wget.exe "https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe"
             .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
       - run:
-          name: Build
+          name: Install CUDA Toolkit
           command: |
-            $Env:PATH = "${Env:PATH};C:\Program Files (x86)\Windows Kits\10\bin\x64"
-            $Env:PATH = "${Env:PATH};C:\Program Files (x86)\Windows Kits\10\bin\10.0.22000.0\x64"
-            $Env:PATH = "${Env:PATH};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\bin\HostX64\x64"
+            wget.exe "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
+            .\cuda_11.8.0_windows_network.exe -s cudart_11.8 nvcc_11.8 cublas_11.8 cublas_dev_11.8
+      - run:
+          name: "Install Dotnet 8"
+          command: |
+            mkdir dotnet
+            cd dotnet
+            $dotnet_url="https://download.visualstudio.microsoft.com/download/pr/5af098e1-e433-4fda-84af-3f54fd27c108/6bd1c6e48e64e64871957289023ca590/dotnet-sdk-8.0.302-win-x64.zip"
+            wget.exe "$dotnet_url"
+            Expand-Archive -LiteralPath .\dotnet-sdk-8.0.302-win-x64.zip
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+      - run:
+          name: "Setup Azure SignTool"
+          command: |
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            $Env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE=$true
+            dotnet tool install --global AzureSignTool
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+            $vsInstallPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -property installationpath
+            Import-Module "${vsInstallPath}\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+            Enter-VsDevShell -VsInstallPath "$vsInstallPath" -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+
             $Env:PATH = "${Env:PATH};C:\VulkanSDK\1.3.261.1\bin"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22000.0\ucrt\x64"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22000.0\um\x64"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\lib\x64"
-            $Env:LIB = "${Env:LIB};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\ATLMFC\lib\x64"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\ucrt"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\um"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\shared"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\winrt"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Windows Kits\10\include\10.0.22000.0\cppwinrt"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\VS\include"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\include"
-            $Env:INCLUDE = "${Env:INCLUDE};C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\ATLMFC\include"
-            $Env:VULKAN_SDK = "C:\VulkanSDK\1.3.261.1"
+            $Env:PATH = "${Env:PATH};C:\Qt\Tools\QtInstallerFramework\4.8\bin"
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            ccache -o "cache_dir=${pwd}\..\.ccache" -o max_size=500M -p -z
             mkdir build
             cd build
             & "C:\Qt\Tools\CMake_64\bin\cmake.exe" `
-              "-DCMAKE_GENERATOR:STRING=Ninja" `
-              "-DCMAKE_BUILD_TYPE=Release" `
+              -S ..\gpt4all-chat -B . -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
               "-DCMAKE_PREFIX_PATH:PATH=C:\Qt\6.5.1\msvc2019_64" `
               "-DCMAKE_MAKE_PROGRAM:FILEPATH=C:\Qt\Tools\Ninja\ninja.exe" `
-              "-DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON" `
-              "-S ..\gpt4all-chat" `
-              "-B ."
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON `
+              -DGPT4ALL_OFFLINE_INSTALLER=OFF
             & "C:\Qt\Tools\Ninja\ninja.exe"
+            & "C:\Qt\Tools\Ninja\ninja.exe" install
+            & "C:\Qt\Tools\Ninja\ninja.exe" package
+            ccache -s
+            mkdir upload
+            copy gpt4all-installer-win64.exe upload
+            Set-Location -Path "_CPack_Packages/win64/IFW/gpt4all-installer-win64"
+            Compress-Archive -Path 'repository' -DestinationPath '..\..\..\..\upload\repository.zip'
+      - store_artifacts:
+          path: build/upload
+      - save_cache:
+          key: ccache-gpt4all-win-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ..\.ccache
+      # add workspace so signing jobs can connect & obtain dmg
+      - persist_to_workspace:
+          root: build
+          # specify path to only include components we want to persist
+          # accross builds
+          paths:
+            - upload
 
-  build-gpt4all-chat-macos:
-    macos:
-      xcode: 14.0.0
+  sign-online-chat-installer-windows:
+    machine:
+      image: windows-server-2022-gui:2024.04.1
+      resource_class: windows.large
+      shell: powershell.exe -ExecutionPolicy Bypass
+    steps:
+      - checkout
+      - attach_workspace:
+          at: build
+      - run:
+          name: Install dependencies
+          command: choco install -y wget
+      - run:
+          name: "Install Dotnet 8"
+          command: |
+            mkdir dotnet
+            cd dotnet
+            $dotnet_url="https://download.visualstudio.microsoft.com/download/pr/5af098e1-e433-4fda-84af-3f54fd27c108/6bd1c6e48e64e64871957289023ca590/dotnet-sdk-8.0.302-win-x64.zip"
+            wget.exe "$dotnet_url"
+            Expand-Archive -LiteralPath .\dotnet-sdk-8.0.302-win-x64.zip
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+      - run:
+          name: "Setup Azure SignTool"
+          command: |
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            $Env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE=$true
+            dotnet tool install --global AzureSignTool
+      - run:
+          name: "Sign Windows Installer With AST"
+          command: |
+            $Env:DOTNET_ROOT="$($(Get-Location).Path)\dotnet\dotnet-sdk-8.0.302-win-x64"
+            $Env:PATH="$Env:DOTNET_ROOT;$Env:PATH"
+            AzureSignTool.exe sign -du "https://gpt4all.io/index.html" -kvu https://gpt4all.vault.azure.net -kvi "$Env:AZSignGUID" -kvs "$Env:AZSignPWD" -kvc "$Env:AZSignCertName" -kvt "$Env:AZSignTID" -tr http://timestamp.digicert.com -v "$($(Get-Location).Path)/build/upload/gpt4all-installer-win64.exe"
+      - store_artifacts:
+          path: build/upload
+
+  build-gpt4all-chat-linux:
+    machine:
+      image: ubuntu-2204:current
     steps:
       - checkout
       - run:
@@ -313,107 +731,257 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
-      - restore_cache:  # this is the new step to restore cache
+      - restore_cache:
           keys:
-            - macos-qt-cache_v2
+            - ccache-gpt4all-linux-amd64-
+      - run:
+          name: Setup Linux and Dependencies
+          command: |
+            # Prevent apt-get from interactively prompting for service restart
+            echo "\$nrconf{restart} = 'l'" | sudo tee /etc/needrestart/conf.d/90-autorestart.conf >/dev/null
+            wget -qO- "https://packages.lunarg.com/lunarg-signing-key-pub.asc" | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+            wget -qO- "https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-jammy.list" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-jammy.list
+            wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            packages=(
+              bison build-essential ccache cuda-compiler-11-8 flex g++-12 gperf libcublas-dev-11-8 libfontconfig1
+              libfreetype6 libgl1-mesa-dev libmysqlclient21 libnvidia-compute-550-server libodbc2 libpq5 libwayland-dev
+              libx11-6 libx11-xcb1 libxcb-cursor0 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+              libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-util1 libxcb-xfixes0 libxcb-xinerama0
+              libxcb-xkb1 libxcb1 libxext6 libxfixes3 libxi6 libxkbcommon-dev libxkbcommon-x11-0 libxrender1 python3
+              vulkan-sdk
+            )
+            sudo apt-get update
+            sudo apt-get install -y "${packages[@]}"
       - run:
           name: Installing Qt
           command: |
-            if [ ! -d ~/Qt ]; then
-              curl -o qt-unified-macOS-x64-4.6.0-online.dmg https://gpt4all.io/ci/qt-unified-macOS-x64-4.6.0-online.dmg
-              hdiutil attach qt-unified-macOS-x64-4.6.0-online.dmg
-              /Volumes/qt-unified-macOS-x64-4.6.0-online/qt-unified-macOS-x64-4.6.0-online.app/Contents/MacOS/qt-unified-macOS-x64-4.6.0-online --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.46 qt.tools.ninja qt.qt6.651.clang_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
-              hdiutil detach /Volumes/qt-unified-macOS-x64-4.6.0-online
-            fi
-      - save_cache:  # this is the new step to save cache
-          key: macos-qt-cache_v2
-          paths:
-            - ~/Qt
+            wget "https://gpt4all.io/ci/qt-unified-linux-x64-4.6.0-online.run"
+            chmod +x qt-unified-linux-x64-4.6.0-online.run
+            ./qt-unified-linux-x64-4.6.0-online.run --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.gcc_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
       - run:
           name: Build
+          no_output_timeout: 30m
           command: |
-            mkdir build
-            cd build
-            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake \
-              -DCMAKE_GENERATOR:STRING=Ninja \
-              -DBUILD_UNIVERSAL=ON \
+            export CMAKE_PREFIX_PATH=~/Qt/6.5.1/gcc_64/lib/cmake
+            export PATH=$PATH:/usr/local/cuda/bin
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
+            ~/Qt/Tools/CMake/bin/cmake \
+              -S gpt4all-chat -B build \
               -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_PREFIX_PATH:PATH=~/Qt/6.5.1/macos/lib/cmake/Qt6 \
+              -DCMAKE_C_COMPILER=gcc-12 \
+              -DCMAKE_CXX_COMPILER=g++-12 \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON
+            ~/Qt/Tools/CMake/bin/cmake --build build -j$(nproc) --target all
+            ccache -s
+      - save_cache:
+          key: ccache-gpt4all-linux-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
+
+  build-gpt4all-chat-windows:
+    machine:
+      image: windows-server-2022-gui:2024.04.1
+      resource_class: windows.large
+      shell: powershell.exe -ExecutionPolicy Bypass
+    steps:
+      - checkout
+      - run:
+          name: Update Submodules
+          command: |
+            git submodule sync
+            git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-win-amd64-
+      - run:
+          name: Install dependencies
+          command: choco install -y ccache wget
+      - run:
+          name: Installing Qt
+          command: |
+            wget.exe "https://gpt4all.io/ci/qt-unified-windows-x64-4.6.0-online.exe"
+            & .\qt-unified-windows-x64-4.6.0-online.exe --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email ${Env:QT_EMAIL} --password ${Env:QT_PASSWORD} install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.win64_msvc2019_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
+      - run:
+          name: Install VulkanSDK
+          command: |
+            wget.exe "https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe"
+            .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
+      - run:
+          name: Install CUDA Toolkit
+          command: |
+            wget.exe "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
+            .\cuda_11.8.0_windows_network.exe -s cudart_11.8 nvcc_11.8 cublas_11.8 cublas_dev_11.8
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+            $vsInstallPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -property installationpath
+            Import-Module "${vsInstallPath}\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+            Enter-VsDevShell -VsInstallPath "$vsInstallPath" -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+
+            $Env:PATH = "${Env:PATH};C:\VulkanSDK\1.3.261.1\bin"
+            $Env:VULKAN_SDK = "C:\VulkanSDK\1.3.261.1"
+            ccache -o "cache_dir=${pwd}\..\.ccache" -o max_size=500M -p -z
+            & "C:\Qt\Tools\CMake_64\bin\cmake.exe" `
+              -S gpt4all-chat -B build -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              "-DCMAKE_PREFIX_PATH:PATH=C:\Qt\6.5.1\msvc2019_64" `
+              "-DCMAKE_MAKE_PROGRAM:FILEPATH=C:\Qt\Tools\Ninja\ninja.exe" `
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON
+            & "C:\Qt\Tools\Ninja\ninja.exe" -C build
+            ccache -s
+      - save_cache:
+          key: ccache-gpt4all-win-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ..\.ccache
+
+  build-gpt4all-chat-macos:
+    macos:
+      xcode: 15.4.0
+    steps:
+      - checkout
+      - run:
+          name: Update Submodules
+          command: |
+            git submodule sync
+            git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-macos-
+      - run:
+          name: Install Rosetta
+          command: softwareupdate --install-rosetta --agree-to-license  # needed for QtIFW
+      - run:
+          name: Install dependencies
+          command: brew install ccache wget
+      - run:
+          name: Installing Qt
+          command: |
+            wget "https://gpt4all.io/ci/qt-unified-macOS-x64-4.6.0-online.dmg"
+            hdiutil attach qt-unified-macOS-x64-4.6.0-online.dmg
+            /Volumes/qt-unified-macOS-x64-4.6.0-online/qt-unified-macOS-x64-4.6.0-online.app/Contents/MacOS/qt-unified-macOS-x64-4.6.0-online --no-force-installations --no-default-installations --no-size-checking --default-answer --accept-licenses --confirm-command --accept-obligations --email $QT_EMAIL --password $QT_PASSWORD install qt.tools.cmake qt.tools.ifw.48 qt.tools.ninja qt.qt6.651.clang_64 qt.qt6.651.qt5compat qt.qt6.651.debug_info qt.qt6.651.addons.qtpdf qt.qt6.651.addons.qthttpserver
+            hdiutil detach /Volumes/qt-unified-macOS-x64-4.6.0-online
+      - run:
+          name: Build
+          no_output_timeout: 30m
+          command: |
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
+            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake \
+              -S gpt4all-chat -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH:PATH=~/Qt/6.5.1/macos/lib/cmake \
               -DCMAKE_MAKE_PROGRAM:FILEPATH=~/Qt/Tools/Ninja/ninja \
-              -S ../gpt4all-chat \
-              -B .
-            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build . --target all
-  build-ts-docs: 
-    docker: 
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DBUILD_UNIVERSAL=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.6 \
+              -DGGML_METAL_MACOSX_VERSION_MIN=12.6
+            ~/Qt/Tools/CMake/CMake.app/Contents/bin/cmake --build build --target all
+            ccache -s
+      - save_cache:
+          key: ccache-gpt4all-macos-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
+
+  build-ts-docs:
+    docker:
       - image: cimg/base:stable
     steps:
       - checkout
       - node/install:
-          install-yarn: true
           node-version: "18.16"
       - run: node --version
       - run: corepack enable
       - node/install-packages:
-          pkg-manager: yarn
+          pkg-manager: npm
           app-dir: gpt4all-bindings/typescript
-          override-ci-command: yarn install
+          override-ci-command: npm install --ignore-scripts
       - run:
           name: build docs ts yo
           command: |
             cd gpt4all-bindings/typescript
-            yarn docs:build
+            npm run docs:build
+
   build-py-docs:
     docker:
       - image: circleci/python:3.8
     steps:
-      - checkout 
+      - checkout
       - run:
           name: Install dependencies
           command: |
             sudo apt-get update
             sudo apt-get -y install python3 python3-pip
             sudo pip3 install awscli --upgrade
-            sudo pip3 install mkdocs mkdocs-material mkautodoc 'mkdocstrings[python]'
+            sudo pip3 install mkdocs mkdocs-material mkautodoc 'mkdocstrings[python]' markdown-captions pillow cairosvg
       - run:
           name: Make Documentation
           command: |
-            cd gpt4all-bindings/python/
+            cd gpt4all-bindings/python
             mkdocs build
       - run:
           name: Deploy Documentation
           command: |
-            cd gpt4all-bindings/python/
-            aws s3 cp ./site s3://docs.gpt4all.io/ --recursive | cat
+            cd gpt4all-bindings/python
+            aws s3 sync --delete site/ s3://docs.gpt4all.io/
       - run:
           name: Invalidate docs.gpt4all.io cloudfront
           command: aws cloudfront create-invalidation --distribution-id E1STQOW63QL2OH --paths "/*"
 
   build-py-linux:
     machine:
-      image: ubuntu-2204:2023.04.2
+      image: ubuntu-2204:current
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-linux-amd64-
       - run:
           name: Set Python Version
           command: pyenv global 3.11.2
       - run:
           name: Install dependencies
           command: |
-            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list http://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            wget -qO- "https://packages.lunarg.com/lunarg-signing-key-pub.asc" | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+            wget -qO- "https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-jammy.list" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-jammy.list
+            wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            packages=(
+              build-essential ccache cmake cuda-compiler-11-8 g++-12 libcublas-dev-11-8 libnvidia-compute-550-server
+              vulkan-sdk
+            )
             sudo apt-get update
-            sudo apt-get install -y cmake build-essential vulkan-sdk
+            sudo apt-get install -y "${packages[@]}"
             pip install setuptools wheel cmake
       - run:
           name: Build C library
+          no_output_timeout: 30m
           command: |
-            git submodule init
-            git submodule update
+            export PATH=$PATH:/usr/local/cuda/bin
+            git submodule update --init --recursive
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
             cd gpt4all-backend
-            mkdir build
-            cd build
-            cmake ..
-            cmake --build . --parallel
+            cmake -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=gcc-12 \
+              -DCMAKE_CXX_COMPILER=g++-12 \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON \
+              -DCMAKE_CUDA_ARCHITECTURES='52-virtual;61-virtual;70-virtual;75-virtual'
+            cmake --build build -j$(nproc)
+            ccache -s
       - run:
           name: Build wheel
           command: |
@@ -421,6 +989,11 @@ jobs:
             python setup.py bdist_wheel --plat-name=manylinux1_x86_64
       - store_artifacts:
           path: gpt4all-bindings/python/dist
+      - save_cache:
+          key: ccache-gpt4all-linux-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
       - persist_to_workspace:
           root: gpt4all-bindings/python/dist
           paths:
@@ -428,25 +1001,34 @@ jobs:
 
   build-py-macos:
     macos:
-      xcode: "14.2.0"
+      xcode: 15.4.0
     resource_class: macos.m1.large.gen1
     steps:
       - checkout
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-macos-
       - run:
           name: Install dependencies
           command: |
-            brew install cmake
+            brew install ccache cmake
             pip install setuptools wheel cmake
       - run:
           name: Build C library
+          no_output_timeout: 30m
           command: |
-            git submodule init
-            git submodule update
+            git submodule update --init  # don't use --recursive because macOS doesn't use Kompute
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
             cd gpt4all-backend
-            mkdir build
-            cd build
-            cmake .. -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
-            cmake --build . --parallel
+            cmake -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DBUILD_UNIVERSAL=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.6 \
+              -DGGML_METAL_MACOSX_VERSION_MIN=12.6
+            cmake --build build --parallel
+            ccache -s
       - run:
           name: Build wheel
           command: |
@@ -454,64 +1036,87 @@ jobs:
             python setup.py bdist_wheel --plat-name=macosx_10_15_universal2
       - store_artifacts:
           path: gpt4all-bindings/python/dist
+      - save_cache:
+          key: ccache-gpt4all-macos-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
       - persist_to_workspace:
           root: gpt4all-bindings/python/dist
           paths:
             - "*.whl"
 
   build-py-windows:
-    executor:
-      name: win/default
+    machine:
+      image: windows-server-2022-gui:2024.04.1
+      resource_class: windows.large
+      shell: powershell.exe -ExecutionPolicy Bypass
     steps:
       - checkout
       - run:
-          name: Install MinGW64
-          command: choco install -y mingw --force --no-progress
-      - run:
-          name: Install VulkanSDK
+          name: Update Submodules
           command: |
-            Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe -OutFile VulkanSDK-1.3.261.1-Installer.exe
-            .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
+            git submodule sync
+            git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-win-amd64-
       - run:
           name: Install dependencies
           command:
-            choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+            choco install -y ccache cmake ninja wget --installargs 'ADD_CMAKE_TO_PATH=System'
+      - run:
+          name: Install VulkanSDK
+          command: |
+            wget.exe "https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe"
+            .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
+      - run:
+          name: Install CUDA Toolkit
+          command: |
+            wget.exe "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
+            .\cuda_11.8.0_windows_network.exe -s cudart_11.8 nvcc_11.8 cublas_11.8 cublas_dev_11.8
       - run:
           name: Install Python dependencies
           command: pip install setuptools wheel cmake
       - run:
           name: Build C library
+          no_output_timeout: 30m
           command: |
-            git submodule init
-            git submodule update
-            cd gpt4all-backend
-            mkdir build
-            cd build
-            $Env:Path += ";C:\ProgramData\mingw64\mingw64\bin"
-            $Env:Path += ";C:\VulkanSDK\1.3.261.1\bin"
+            $vsInstallPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -property installationpath
+            Import-Module "${vsInstallPath}\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+            Enter-VsDevShell -VsInstallPath "$vsInstallPath" -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+
+            $Env:PATH += ";C:\VulkanSDK\1.3.261.1\bin"
             $Env:VULKAN_SDK = "C:\VulkanSDK\1.3.261.1"
-            cmake -G "MinGW Makefiles" .. -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON -DKOMPUTE_OPT_USE_BUILT_IN_VULKAN_HEADER=OFF
-            cmake --build . --parallel
+            ccache -o "cache_dir=${pwd}\..\.ccache" -o max_size=500M -p -z
+            cd gpt4all-backend
+            cmake -B build -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON `
+              -DCMAKE_CUDA_ARCHITECTURES='52-virtual;61-virtual;70-virtual;75-virtual'
+            cmake --build build --parallel
+            ccache -s
       - run:
           name: Build wheel
-          # TODO: As part of this task, we need to move mingw64 binaries into package.
-          # This is terrible and needs a more robust solution eventually.
           command: |
             cd gpt4all-bindings/python
-            cd gpt4all
-            mkdir llmodel_DO_NOT_MODIFY
-            mkdir llmodel_DO_NOT_MODIFY/build/
-            cp 'C:\ProgramData\mingw64\mingw64\bin\*dll' 'llmodel_DO_NOT_MODIFY/build/'
-            cd ..
             python setup.py bdist_wheel --plat-name=win_amd64
       - store_artifacts:
           path: gpt4all-bindings/python/dist
+      - save_cache:
+          key: ccache-gpt4all-win-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ..\.ccache
       - persist_to_workspace:
           root: gpt4all-bindings/python/dist
           paths:
             - "*.whl"
 
-  store-and-upload-wheels:
+  publish-wheels:
     docker:
       - image: circleci/python:3.8
     steps:
@@ -522,7 +1127,7 @@ jobs:
           name: Install dependencies
           command: |
             sudo apt-get update
-            sudo apt-get install -y cmake build-essential
+            sudo apt-get install -y build-essential cmake
             pip install setuptools wheel twine
       - run:
           name: Upload Python package
@@ -533,7 +1138,7 @@ jobs:
 
   build-bindings-backend-linux:
     machine:
-      image: ubuntu-2204:2023.04.2
+      image: ubuntu-2204:current
     steps:
       - checkout
       - run:
@@ -541,23 +1146,49 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-linux-amd64-
       - run:
           name: Install dependencies
           command: |
-            wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list http://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list            
+            wget -qO- "https://packages.lunarg.com/lunarg-signing-key-pub.asc" | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+            wget -qO- "https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-jammy.list" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-jammy.list
+            wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            packages=(
+              build-essential ccache cmake cuda-compiler-11-8 g++-12 libcublas-dev-11-8 libnvidia-compute-550-server
+              vulkan-sdk
+            )
             sudo apt-get update
-            sudo apt-get install -y cmake build-essential vulkan-sdk
+            sudo apt-get install -y "${packages[@]}"
       - run:
           name: Build Libraries
+          no_output_timeout: 30m
           command: |
+            export PATH=$PATH:/usr/local/cuda/bin
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
             cd gpt4all-backend
             mkdir -p runtimes/build
             cd runtimes/build
-            cmake ../..
-            cmake --build . --parallel --config Release
+            cmake ../.. \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=gcc-12 \
+              -DCMAKE_C_COMPILER=g++-12 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON
+            cmake --build . -j$(nproc)
+            ccache -s
             mkdir ../linux-x64
             cp -L *.so ../linux-x64 # otherwise persist_to_workspace seems to mess symlinks
+      - save_cache:
+          key: ccache-gpt4all-linux-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
       - persist_to_workspace:
           root: gpt4all-backend
           paths:
@@ -565,7 +1196,7 @@ jobs:
 
   build-bindings-backend-macos:
     macos:
-      xcode: "14.0.0"
+      xcode: 15.4.0
     steps:
       - checkout
       - run:
@@ -573,22 +1204,39 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-macos-
       - run:
           name: Install dependencies
           command: |
-            brew install cmake
+            brew install ccache cmake
       - run:
           name: Build Libraries
+          no_output_timeout: 30m
           command: |
+            ccache -o "cache_dir=${PWD}/../.ccache" -o max_size=500M -p -z
             cd gpt4all-backend
             mkdir -p runtimes/build
             cd runtimes/build
-            cmake ../.. -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
-            cmake --build . --parallel --config Release
+            cmake ../.. \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DBUILD_UNIVERSAL=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.6 \
+              -DGGML_METAL_MACOSX_VERSION_MIN=12.6
+            cmake --build . --parallel
+            ccache -s
             mkdir ../osx-x64
             cp -L *.dylib ../osx-x64
             cp ../../llama.cpp-mainline/*.metal ../osx-x64
             ls ../osx-x64
+      - save_cache:
+          key: ccache-gpt4all-macos-{{ epoch }}
+          when: always
+          paths:
+            - ../.ccache
       - persist_to_workspace:
           root: gpt4all-backend
           paths:
@@ -596,53 +1244,8 @@ jobs:
             - runtimes/osx-x64/*.metal
 
   build-bindings-backend-windows:
-    executor:
-      name: win/default
-      size: large
-      shell: powershell.exe -ExecutionPolicy Bypass
-    steps:
-      - checkout
-      - run:
-          name: Update Submodules
-          command: |
-            git submodule sync
-            git submodule update --init --recursive
-      - run:
-          name: Install MinGW64
-          command: choco install -y mingw --force --no-progress
-      - run:
-          name: Install VulkanSDK
-          command: |
-            Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe -OutFile VulkanSDK-1.3.261.1-Installer.exe
-            .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
-      - run:
-          name: Install dependencies
-          command: |
-            choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'
-      - run:
-          name: Build Libraries
-          command: |
-            $MinGWBin = "C:\ProgramData\mingw64\mingw64\bin"
-            $Env:Path += ";$MinGwBin"
-            $Env:Path += ";C:\Program Files\CMake\bin"
-            $Env:Path += ";C:\VulkanSDK\1.3.261.1\bin"
-            cd gpt4all-backend
-            mkdir runtimes/win-x64
-            cd runtimes/win-x64
-            cmake -G "MinGW Makefiles" -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON ../..
-            cmake --build . --parallel --config Release
-            cp "$MinGWBin\libgcc*.dll" .
-            cp "$MinGWBin\libstdc++*.dll" .
-            cp "$MinGWBin\libwinpthread*.dll" .
-            cp bin/*.dll .
-      - persist_to_workspace:
-          root: gpt4all-backend
-          paths:
-            - runtimes/win-x64/*.dll
-
-  build-bindings-backend-windows-msvc:
     machine:
-      image: 'windows-server-2022-gui:2023.03.1'
+      image: windows-server-2022-gui:2024.04.1
       resource_class: windows.large
       shell: powershell.exe -ExecutionPolicy Bypass
     steps:
@@ -652,204 +1255,58 @@ jobs:
           command: |
             git submodule sync
             git submodule update --init --recursive
-      - run:
-          name: Install VulkanSDK
-          command: |
-            Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe -OutFile VulkanSDK-1.3.261.1-Installer.exe
-            .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
+      - restore_cache:
+          keys:
+            - ccache-gpt4all-win-amd64-
       - run:
           name: Install dependencies
           command: |
-            choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'  
+            choco install -y ccache cmake ninja wget --installargs 'ADD_CMAKE_TO_PATH=System'
+      - run:
+          name: Install VulkanSDK
+          command: |
+            wget.exe "https://sdk.lunarg.com/sdk/download/1.3.261.1/windows/VulkanSDK-1.3.261.1-Installer.exe"
+            .\VulkanSDK-1.3.261.1-Installer.exe --accept-licenses --default-answer --confirm-command install
+      - run:
+          name: Install CUDA Toolkit
+          command: |
+            wget.exe "https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe"
+            .\cuda_11.8.0_windows_network.exe -s cudart_11.8 nvcc_11.8 cublas_11.8 cublas_dev_11.8
       - run:
           name: Build Libraries
+          no_output_timeout: 30m
           command: |
-            $Env:Path += ";C:\Program Files\CMake\bin"
+            $vsInstallPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -property installationpath
+            Import-Module "${vsInstallPath}\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+            Enter-VsDevShell -VsInstallPath "$vsInstallPath" -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+
             $Env:Path += ";C:\VulkanSDK\1.3.261.1\bin"
+            $Env:VULKAN_SDK = "C:\VulkanSDK\1.3.261.1"
+            ccache -o "cache_dir=${pwd}\..\.ccache" -o max_size=500M -p -z
             cd gpt4all-backend
             mkdir runtimes/win-x64_msvc
             cd runtimes/win-x64_msvc
-            cmake -G "Visual Studio 17 2022" -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON -A X64 ../..
-            cmake --build . --parallel --config Release
+            cmake -S ../.. -B . -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+              -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+              -DKOMPUTE_OPT_DISABLE_VULKAN_VERSION_CHECK=ON
+            cmake --build . --parallel
+            ccache -s
             cp bin/Release/*.dll .
+      - save_cache:
+          key: ccache-gpt4all-win-amd64-{{ epoch }}
+          when: always
+          paths:
+            - ..\.ccache
       - persist_to_workspace:
           root: gpt4all-backend
           paths:
             - runtimes/win-x64_msvc/*.dll
 
-  build-csharp-linux:
+  build-nodejs-linux:
     docker:
-      - image: mcr.microsoft.com/dotnet/sdk:7.0-jammy # Ubuntu 22.04
-    steps:
-      - checkout
-      - attach_workspace:
-          at: /tmp/workspace
-      - run:
-          name: "Prepare Native Libs"
-          command: |
-            cd gpt4all-bindings/csharp
-            mkdir -p runtimes/linux-x64/native
-            cp /tmp/workspace/runtimes/linux-x64/*.so runtimes/linux-x64/native/
-            ls -R runtimes
-      - restore_cache:
-          keys:
-            - gpt4all-csharp-nuget-packages-nix
-      - run:
-          name: "Install project dependencies"
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet restore Gpt4All
-      - save_cache:
-          paths:
-            - ~/.nuget/packages
-          key: gpt4all-csharp-nuget-packages-nix
-      - run:
-          name: Build C# Project
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet build Gpt4All --configuration Release --nologo
-      - run:
-          name: "Run C# Tests"
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet test Gpt4All.Tests -v n -c Release --filter "SKIP_ON_CI!=True" --logger "trx"
-      - run:
-          name: Test results
-          command: |
-              cd gpt4all-bindings/csharp/Gpt4All.Tests
-              dotnet tool install -g trx2junit
-              export PATH="$PATH:$HOME/.dotnet/tools"
-              trx2junit TestResults/*.trx
-      - store_test_results:
-          path: gpt4all-bindings/csharp/Gpt4All.Tests/TestResults
-
-  build-csharp-windows:
-    executor:
-      name: win/default
-      size: large
-      shell: powershell.exe -ExecutionPolicy Bypass
-    steps:
-      - checkout
-      - restore_cache:
-          keys:
-            - gpt4all-csharp-nuget-packages-win
-      - attach_workspace:
-          at: C:\Users\circleci\workspace
-      - run:
-          name: "Prepare Native Libs"
-          command: |
-            cd gpt4all-bindings/csharp
-            mkdir -p runtimes\win-x64\native
-            cp C:\Users\circleci\workspace\runtimes\win-x64\*.dll runtimes\win-x64\native\
-            ls -R runtimes
-      - run:
-          name: "Install project dependencies"
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet.exe restore Gpt4All
-      - save_cache:
-          paths:
-            - C:\Users\circleci\.nuget\packages
-          key: gpt4all-csharp-nuget-packages-win
-      - run:
-          name: Build C# Project
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet.exe build Gpt4All --configuration Release --nologo
-      - run:
-          name: "Run C# Tests"
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet.exe test Gpt4All.Tests -v n -c Release --filter "SKIP_ON_CI!=True" --logger "trx"
-      - run:
-          name: Test results
-          command: |
-              cd gpt4all-bindings/csharp/Gpt4All.Tests
-              dotnet tool install -g trx2junit
-              $Env:Path += ";$Env:USERPROFILE\.dotnet\tools"
-              trx2junit TestResults/*.trx
-      - store_test_results:
-          path: gpt4all-bindings/csharp/Gpt4All.Tests/TestResults
-
-  build-csharp-macos:
-    macos:
-      xcode: "14.0.0"
-    steps:
-      - checkout
-      - restore_cache:
-          keys:
-            - gpt4all-csharp-nuget-packages-nix
-      - run:
-          name: Install dependencies
-          command: |
-            brew install --cask dotnet-sdk
-      - attach_workspace:
-          at: /tmp/workspace
-      - run:
-          name: "Prepare Native Libs"
-          command: |
-            cd gpt4all-bindings/csharp
-            mkdir -p runtimes/osx/native
-            cp /tmp/workspace/runtimes/osx-x64/*.dylib runtimes/osx/native/
-            cp /tmp/workspace/runtimes/osx-x64/*.metal runtimes/osx/native/
-            ls -R runtimes
-      - run:
-          name: "Install project dependencies"
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet restore Gpt4All
-      - save_cache:
-          paths:
-            - ~/.nuget/packages
-          key: gpt4all-csharp-nuget-packages-nix
-      - run:
-          name: Build C# Project
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet build Gpt4All --configuration Release --nologo
-      - run:
-          name: "Run C# Tests"
-          command: |
-            cd gpt4all-bindings/csharp
-            dotnet test Gpt4All.Tests -v n -c Release --filter "SKIP_ON_CI!=True" --logger "trx"
-      - run:
-          name: Test results
-          command: |
-              cd gpt4all-bindings/csharp/Gpt4All.Tests
-              dotnet tool install -g trx2junit
-              export PATH="$PATH:$HOME/.dotnet/tools"
-              trx2junit TestResults/*.trx
-      - store_test_results:
-          path: gpt4all-bindings/csharp/Gpt4All.Tests/TestResults
-
-  store-and-upload-nupkgs:
-    docker:
-      - image: mcr.microsoft.com/dotnet/sdk:6.0-jammy # Ubuntu 22.04
-    steps:
-      - attach_workspace:
-          at: /tmp/workspace
-      - checkout
-      - restore_cache:
-           keys:
-             - gpt4all-csharp-nuget-packages-nix
-      - run:
-          name: NuGet Pack
-          command: |
-            cd gpt4all-bindings/csharp
-            mkdir -p runtimes/linux-x64/native
-            cp /tmp/workspace/runtimes/linux-x64/*.so runtimes/linux-x64/native/
-            mkdir -p runtimes/win-x64/native
-            cp /tmp/workspace/runtimes/win-x64/*.dll runtimes/win-x64/native/
-            mkdir -p runtimes/osx/native
-            cp /tmp/workspace/runtimes/osx-x64/*.dylib runtimes/osx/native/
-            cp /tmp/workspace/runtimes/osx-x64/*.metal runtimes/osx/native/
-            dotnet pack ./Gpt4All/Gpt4All.csproj -p:IncludeSymbols=true -p:SymbolPackageFormat=snupkg -c Release
-            dotnet nuget push ./Gpt4All/bin/Release/Gpt4All.*.nupkg -s $NUGET_URL -k $NUGET_TOKEN --skip-duplicate
-      - store_artifacts:
-          path: gpt4all-bindings/csharp/Gpt4All/bin/Release
-
-  build-nodejs-linux: 
-    docker: 
       - image: cimg/base:stable
     steps:
       - checkout
@@ -865,10 +1322,10 @@ jobs:
           pkg-manager: yarn
           override-ci-command: yarn install
       - run:
-          command: | 
+          command: |
             cd gpt4all-bindings/typescript
             yarn prebuildify -t 18.16.0 --napi
-      - run: 
+      - run:
           command: |
             mkdir -p gpt4all-backend/prebuilds/linux-x64
             mkdir -p gpt4all-backend/runtimes/linux-x64
@@ -877,11 +1334,12 @@ jobs:
       - persist_to_workspace:
           root: gpt4all-backend
           paths:
-            - prebuilds/linux-x64/*.node 
+            - prebuilds/linux-x64/*.node
             - runtimes/linux-x64/*-*.so
-  build-nodejs-macos: 
+
+  build-nodejs-macos:
     macos:
-      xcode: "14.0.0"
+      xcode: 15.4.0
     steps:
       - checkout
       - attach_workspace:
@@ -896,12 +1354,12 @@ jobs:
           pkg-manager: yarn
           override-ci-command: yarn install
       - run:
-          command: | 
+          command: |
             cd gpt4all-bindings/typescript
             yarn prebuildify -t 18.16.0 --napi
-      - run: 
+      - run:
           name: "Persisting all necessary things to workspace"
-          command: |  
+          command: |
             mkdir -p gpt4all-backend/prebuilds/darwin-x64
             mkdir -p gpt4all-backend/runtimes/darwin
             cp /tmp/gpt4all-backend/runtimes/osx-x64/*-*.* gpt4all-backend/runtimes/darwin
@@ -912,7 +1370,7 @@ jobs:
             - prebuilds/darwin-x64/*.node
             - runtimes/darwin/*-*.*
 
-  build-nodejs-windows: 
+  build-nodejs-windows:
     executor:
       name: win/default
       size: large
@@ -923,32 +1381,32 @@ jobs:
           at: /tmp/gpt4all-backend
       - run: choco install wget -y
       - run:
-         command: wget https://nodejs.org/dist/v18.16.0/node-v18.16.0-x86.msi -P C:\Users\circleci\Downloads\
-         shell: cmd.exe
-      - run: MsiExec.exe /i C:\Users\circleci\Downloads\node-v18.16.0-x86.msi /qn
-      - run: 
           command: |
-              Start-Process powershell -verb runAs -Args "-start GeneralProfile"
-              nvm install 18.16.0
-              nvm use 18.16.0
-      - run: node --version 
+            wget.exe "https://nodejs.org/dist/v18.16.0/node-v18.16.0-x86.msi" -P C:\Users\circleci\Downloads\
+            MsiExec.exe /i C:\Users\circleci\Downloads\node-v18.16.0-x86.msi /qn
+      - run:
+          command: |
+            Start-Process powershell -verb runAs -Args "-start GeneralProfile"
+            nvm install 18.16.0
+            nvm use 18.16.0
+      - run: node --version
       - run: corepack enable
-      - run:           
+      - run:
           command: |
             npm install -g yarn
             cd gpt4all-bindings/typescript
             yarn install
       - run:
-          command: | 
+          command: |
             cd gpt4all-bindings/typescript
-            yarn prebuildify -t 18.16.0 --napi 
-      - run: 
+            yarn prebuildify -t 18.16.0 --napi
+      - run:
           command: |
             mkdir -p gpt4all-backend/prebuilds/win32-x64
             mkdir -p gpt4all-backend/runtimes/win32-x64
             cp /tmp/gpt4all-backend/runtimes/win-x64_msvc/*-*.dll gpt4all-backend/runtimes/win32-x64
             cp gpt4all-bindings/typescript/prebuilds/win32-x64/*.node gpt4all-backend/prebuilds/win32-x64
-        
+
       - persist_to_workspace:
           root: gpt4all-backend
           paths:
@@ -956,7 +1414,7 @@ jobs:
             - runtimes/win32-x64/*-*.dll
 
   prepare-npm-pkg:
-    docker: 
+    docker:
       - image: cimg/base:stable
     steps:
       - attach_workspace:
@@ -967,19 +1425,19 @@ jobs:
           node-version: "18.16"
       - run: node --version
       - run: corepack enable
-      - run: 
+      - run:
           command: |
             cd gpt4all-bindings/typescript
             # excluding llmodel. nodejs bindings dont need llmodel.dll
             mkdir -p runtimes/win32-x64/native
             mkdir -p prebuilds/win32-x64/
-            cp /tmp/gpt4all-backend/runtimes/win-x64_msvc/*-*.dll runtimes/win32-x64/native/ 
-            cp /tmp/gpt4all-backend/prebuilds/win32-x64/*.node prebuilds/win32-x64/    
+            cp /tmp/gpt4all-backend/runtimes/win-x64_msvc/*-*.dll runtimes/win32-x64/native/
+            cp /tmp/gpt4all-backend/prebuilds/win32-x64/*.node prebuilds/win32-x64/
 
-            mkdir -p runtimes/linux-x64/native 
+            mkdir -p runtimes/linux-x64/native
             mkdir -p prebuilds/linux-x64/
-            cp /tmp/gpt4all-backend/runtimes/linux-x64/*-*.so runtimes/linux-x64/native/ 
-            cp /tmp/gpt4all-backend/prebuilds/linux-x64/*.node prebuilds/linux-x64/    
+            cp /tmp/gpt4all-backend/runtimes/linux-x64/*-*.so runtimes/linux-x64/native/
+            cp /tmp/gpt4all-backend/prebuilds/linux-x64/*.node prebuilds/linux-x64/
 
             # darwin has univeral runtime libraries
             mkdir -p runtimes/darwin/native
@@ -987,22 +1445,22 @@ jobs:
 
             cp /tmp/gpt4all-backend/runtimes/darwin/*-*.* runtimes/darwin/native/
 
-            cp /tmp/gpt4all-backend/prebuilds/darwin-x64/*.node prebuilds/darwin-x64/    
-            
+            cp /tmp/gpt4all-backend/prebuilds/darwin-x64/*.node prebuilds/darwin-x64/
+
             # Fallback build if user is not on above prebuilds
             mv -f binding.ci.gyp binding.gyp
 
             mkdir gpt4all-backend
             cd ../../gpt4all-backend
             mv llmodel.h llmodel.cpp llmodel_c.cpp llmodel_c.h sysinfo.h dlhandle.h ../gpt4all-bindings/typescript/gpt4all-backend/
-            
+
       # Test install
       - node/install-packages:
           app-dir: gpt4all-bindings/typescript
           pkg-manager: yarn
           override-ci-command: yarn install
-      - run: 
-          command: | 
+      - run:
+          command: |
             cd gpt4all-bindings/typescript
             yarn run test
       - run:
@@ -1011,15 +1469,23 @@ jobs:
             npm set //registry.npmjs.org/:_authToken=$NPM_TOKEN
             npm publish
 
+main_only: &main_only
+  filters:
+    branches:
+      only: main
+
 workflows:
   version: 2
-  default:
+  noop:
     when:
-      or:
-       - << pipeline.parameters.run-all-workflows >>
-       - << pipeline.parameters.run-default-workflow >>
+      not:
+        or:
+          - << pipeline.parameters.run-all-workflows >>
+          - << pipeline.parameters.run-python-workflow >>
+          - << pipeline.parameters.run-ts-workflow >>
+          - << pipeline.parameters.run-chat-workflow >>
     jobs:
-      - default-job
+      - noop
   build-chat-offline-installers:
     when:
       or:
@@ -1029,12 +1495,66 @@ workflows:
       - hold:
           type: approval
       - build-offline-chat-installer-macos:
+          context: gpt4all
           requires:
             - hold
+      - sign-offline-chat-installer-macos:
+          context: gpt4all
+          requires:
+            - build-offline-chat-installer-macos
+      - notarize-offline-chat-installer-macos:
+          context: gpt4all
+          requires:
+            - sign-offline-chat-installer-macos
       - build-offline-chat-installer-windows:
+          context: gpt4all
           requires:
             - hold
+      - sign-offline-chat-installer-windows:
+          context: gpt4all
+          requires:
+            - build-offline-chat-installer-windows
       - build-offline-chat-installer-linux:
+          context: gpt4all
+          requires:
+            - hold
+  build-chat-online-installers:
+    when:
+      or:
+        - << pipeline.parameters.run-all-workflows >>
+        - << pipeline.parameters.run-chat-workflow >>
+    jobs:
+      - hold:
+          <<: *main_only
+          type: approval
+      - build-online-chat-installer-macos:
+          <<: *main_only
+          context: gpt4all
+          requires:
+            - hold
+      - sign-online-chat-installer-macos:
+          <<: *main_only
+          context: gpt4all
+          requires:
+            - build-online-chat-installer-macos
+      - notarize-online-chat-installer-macos:
+          <<: *main_only
+          context: gpt4all
+          requires:
+            - sign-online-chat-installer-macos
+      - build-online-chat-installer-windows:
+          <<: *main_only
+          context: gpt4all
+          requires:
+            - hold
+      - sign-online-chat-installer-windows:
+          <<: *main_only
+          context: gpt4all
+          requires:
+            - build-online-chat-installer-windows
+      - build-online-chat-installer-linux:
+          <<: *main_only
+          context: gpt4all
           requires:
             - hold
   build-and-test-gpt4all-chat:
@@ -1046,12 +1566,15 @@ workflows:
       - hold:
           type: approval
       - build-gpt4all-chat-linux:
+          context: gpt4all
           requires:
             - hold
       - build-gpt4all-chat-windows:
+          context: gpt4all
           requires:
             - hold
       - build-gpt4all-chat-macos:
+          context: gpt4all
           requires:
             - hold
   deploy-docs:
@@ -1061,152 +1584,79 @@ workflows:
         - << pipeline.parameters.run-python-workflow >>
     jobs:
       - build-ts-docs:
-          filters:
-            branches:
-              only:
-                - main
+          <<: *main_only
       - build-py-docs:
-          filters:
-            branches:
-              only:
-                - main
-  build-py-deploy:
+          <<: *main_only
+          context: gpt4all
+  build-python:
     when:
       or:
         - << pipeline.parameters.run-all-workflows >>
         - << pipeline.parameters.run-python-workflow >>
     jobs:
       - pypi-hold:
+          <<: *main_only
           type: approval
       - hold:
           type: approval
       - build-py-linux:
-          filters:
-            branches:
-              only:
           requires:
             - hold
       - build-py-macos:
-          filters:
-            branches:
-              only:
           requires:
             - hold
       - build-py-windows:
-          filters:
-            branches:
-              only:
           requires:
             - hold
-      - store-and-upload-wheels:
-          filters:
-            branches:
-              only:
+      - publish-wheels:
+          <<: *main_only
+          context: gpt4all
           requires:
             - pypi-hold
             - build-py-windows
             - build-py-linux
             - build-py-macos
   build-bindings:
-    when: 
+    when:
       or:
        - << pipeline.parameters.run-all-workflows >>
        - << pipeline.parameters.run-python-workflow >>
-       - << pipeline.parameters.run-csharp-workflow >>
        - << pipeline.parameters.run-ts-workflow >>
     jobs:
       - hold:
           type: approval
-      - nuget-hold:
+      - nodejs-hold:
           type: approval
       - npm-hold:
+          <<: *main_only
           type: approval
       - build-bindings-backend-linux:
-          filters:
-            branches:
-              only:
           requires:
             - hold
       - build-bindings-backend-macos:
-          filters:
-            branches:
-              only:
           requires:
             - hold
       - build-bindings-backend-windows:
-          filters:
-            branches:
-              only:
-          requires:
-            - hold
-      - build-bindings-backend-windows-msvc:
-          filters:
-            branches:
-              only:
           requires:
             - hold
 
-      # NodeJs Jobs 
-      - prepare-npm-pkg: 
-          filters:
-            branches:
-              only:
+      # NodeJs Jobs
+      - prepare-npm-pkg:
+          <<: *main_only
           requires:
             - npm-hold
             - build-nodejs-linux
             - build-nodejs-windows
             - build-nodejs-macos
       - build-nodejs-linux:
-          filters:
-            branches:
-              only:
           requires:
-            - npm-hold
+            - nodejs-hold
             - build-bindings-backend-linux
       - build-nodejs-windows:
-          filters:
-            branches:
-              only:
           requires:
-            - npm-hold
-            - build-bindings-backend-windows-msvc
-      - build-nodejs-macos:
-          filters:
-            branches:
-              only:
-          requires:
-            - npm-hold
-            - build-bindings-backend-macos
-
-
-      # CSharp Jobs
-      - build-csharp-linux:
-          filters:
-            branches:
-              only:
-          requires:
-            - nuget-hold
-            - build-bindings-backend-linux
-      - build-csharp-windows:
-          filters:
-            branches:
-              only:
-          requires:
-            - nuget-hold
+            - nodejs-hold
             - build-bindings-backend-windows
-      - build-csharp-macos:
-          filters:
-            branches:
-              only:
+      - build-nodejs-macos:
           requires:
-            - nuget-hold
+            - nodejs-hold
             - build-bindings-backend-macos
-      - store-and-upload-nupkgs:
-          filters:
-            branches:
-              only:
-          requires:
-            - nuget-hold
-            - build-csharp-windows
-            - build-csharp-linux
-            - build-csharp-macos

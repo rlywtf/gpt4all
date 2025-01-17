@@ -2,6 +2,7 @@ import QtCore
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Basic
+import QtQuick.Controls.impl
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import Qt.labs.folderlistmodel
@@ -14,44 +15,12 @@ Item {
         id: theme
     }
 
-    property alias title: titleLabelText.text
     property ListModel tabTitlesModel: ListModel { }
     property list<Component> tabs: [ ]
 
-    Rectangle {
-        id: titleLabel
-        anchors.top: parent.top
-        anchors.leftMargin: 20
-        anchors.rightMargin: 15
-        anchors.left: parent.left
-        anchors.right: parent.right
-        height: titleLabelText.height
-        color: "transparent"
-        Label {
-            id: titleLabelText
-            anchors.left: parent.left
-            color: theme.titleTextColor
-            topPadding: 10
-            bottomPadding: 10
-            font.pixelSize: theme.fontSizeLargest
-            font.bold: true
-        }
-    }
-
-    Rectangle {
-        anchors.top: titleLabel.bottom
-        anchors.leftMargin: 20
-        anchors.rightMargin: 15
-        anchors.left: parent.left
-        anchors.right: parent.right
-        height: 3
-        color: theme.accentColor
-    }
-
     TabBar {
         id: settingsTabBar
-        anchors.top: titleLabel.bottom
-        anchors.topMargin: 15
+        anchors.top: parent.top
         anchors.horizontalCenter: parent.horizontalCenter
         width: parent.width / 1.75
         z: 200
@@ -89,24 +58,14 @@ Item {
         anchors.rightMargin: 15
         anchors.left: parent.left
         anchors.right: parent.right
-        height: 3
-        color: theme.accentColor
-    }
-
-    FolderDialog {
-        id: folderDialog
-        title: qsTr("Please choose a directory")
-    }
-
-    function openFolderDialog(currentFolder, onAccepted) {
-        folderDialog.currentFolder = currentFolder;
-        folderDialog.accepted.connect(function() { onAccepted(folderDialog.currentFolder); });
-        folderDialog.open();
+        height: 1
+        color: theme.settingsDivider
     }
 
     StackLayout {
         id: stackLayout
-        anchors.top: tabTitlesModel.count > 1 ? dividerTabBar.bottom : titleLabel.bottom
+        anchors.top: tabTitlesModel.count > 1 ? dividerTabBar.bottom : parent.top
+        anchors.topMargin: 5
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -119,7 +78,6 @@ Item {
                 sourceComponent: model.modelData
                 onLoaded: {
                     settingsStack.tabTitlesModel.append({ "title": loader.item.title });
-                    item.openFolderDialog = settingsStack.openFolderDialog;
                 }
             }
         }

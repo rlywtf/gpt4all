@@ -1,4 +1,25 @@
 [submodule "llama.cpp-mainline"]
-	path = gpt4all-backend/llama.cpp-mainline
+	path = gpt4all-backend/deps/llama.cpp-mainline
 	url = https://github.com/nomic-ai/llama.cpp.git
-	branch = gguf
+	branch = master
+[submodule "gpt4all-chat/usearch"]
+	path = gpt4all-chat/deps/usearch
+	url = https://github.com/nomic-ai/usearch.git
+[submodule "gpt4all-chat/deps/SingleApplication"]
+	path = gpt4all-chat/deps/SingleApplication
+	url = https://github.com/nomic-ai/SingleApplication.git
+[submodule "gpt4all-chat/deps/fmt"]
+	path = gpt4all-chat/deps/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "gpt4all-chat/deps/DuckX"]
+	path = gpt4all-chat/deps/DuckX
+	url = https://github.com/nomic-ai/DuckX.git
+[submodule "gpt4all-chat/deps/QXlsx"]
+	path = gpt4all-chat/deps/QXlsx
+	url = https://github.com/nomic-ai/QXlsx.git
+[submodule "gpt4all-chat/deps/Jinja2Cpp"]
+	path = gpt4all-chat/deps/Jinja2Cpp
+	url = https://github.com/nomic-ai/jinja2cpp.git
+[submodule "gpt4all-chat/deps/rapidjson"]
+	path = gpt4all-chat/deps/rapidjson
+	url = https://github.com/nomic-ai/rapidjson.git
